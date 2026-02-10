@@ -2,45 +2,17 @@ import json
 from datetime import datetime, timedelta, timezone
 import db_utils
 import pandas as pd
-import credentials_dev
+import credentials
 import time
 import sheet_utils
 import telegram
 
-# new
-def get_fallback_balance_data(pm, curr_timestamp, pm_data_list, default_lookback_minutes=5):
+
+def get_fallback_balance_data(pm, curr_timestamp, max_lookback_hours=2):
     """
-    Get the most recent valid balance data for a PM within the lookback period.
-    Lookback period is determined by PM's update frequency from configuration.
-    
-    Args:
-        pm: PM identifier
-        curr_timestamp: Current timestamp
-        pm_data_list: List of PM configurations from credentials_dev.PM_DATA
-        default_lookback_minutes: Default lookback in minutes if PM not found in config
-    
-    Returns:
-        DataFrame with fallback balance data or empty DataFrame
+    Get the most recent valid balance data for a PM within the lookback period
     """
-    # Find PM's update frequency from configuration
-    pm_config = next((p for p in pm_data_list if p['pm'] == pm), None)
-    
-    if pm_config and 'update_frequency' in pm_config:
-        update_freq = pm_config['update_frequency']
-        
-        # Set lookback based on update frequency
-        if update_freq == 'hour':
-            max_lookback_hours = 2
-            lookback_start = curr_timestamp - timedelta(hours=max_lookback_hours)
-        elif update_freq == 'minute':
-            max_lookback_minutes = 5
-            lookback_start = curr_timestamp - timedelta(minutes=max_lookback_minutes)
-        else:
-            # Default to minute-level if frequency not recognized
-            lookback_start = curr_timestamp - timedelta(minutes=default_lookback_minutes)
-    else:
-        # Default to minute-level if PM not found in config
-        lookback_start = curr_timestamp - timedelta(minutes=default_lookback_minutes)
+    lookback_start = curr_timestamp - timedelta(hours=max_lookback_hours)
     
     query = f'''
         SELECT 
@@ -60,31 +32,34 @@ def get_fallback_balance_data(pm, curr_timestamp, pm_data_list, default_lookback
     '''
     
     fallback_data = db_utils.get_db_table(query=query)
+    # return pd.DataFrame()
     return fallback_data
 
-def get_pm_status_from_config(pm, pm_data_list):
-    """
-    Check if a PM is active based on the PM_DATA configuration
-    Returns: 'active', 'inactive', or 'not_found'
-    """
-    for pm_info in pm_data_list:
-        if pm_info['pm'] == pm:
-            if pm_info.get('active', False):  # Default to True if 'active' key doesn't exist
-                return 'active'
-            else:
-                return 'inactive'
-    
-    return 'not_found'  # PM not in configuration
-
-def validate_and_enhance_balance_data(balance_df, curr_timestamp, pm_data_list):
+def validate_and_enhance_balance_data(balance_df, curr_timestamp):
     """
     Validate balance data and handle missing PMs based on their active status
     - Inactive PMs: Use current data if available, but NO fallback if missing
     - Active PMs: Use current data or fallback data if missing
+    
+    Args:
+        balance_df: DataFrame with current balance data
+        curr_timestamp: Current timestamp for validation
+    
+    Returns:
+        tuple: (enhanced_balance_df, validation_log)
     """
+    # Get PM mapping data from database
+    pm_mapping_query = 'SELECT pm, pm_group, "group", fund, active, if_btc FROM pm_mapping;'
+    pm_mapping_df = db_utils.get_db_table(pm_mapping_query)
+    print('pm_mapping_df')
+    print(pm_mapping_df)
+    
+    if pm_mapping_df.empty:
+        raise ValueError("Failed to load PM mapping data from database")
+    
     # Create sets of PMs based on their active status
-    active_pms = {pm_info['pm'] for pm_info in pm_data_list if pm_info.get('active', True)}
-    inactive_pms = {pm_info['pm'] for pm_info in pm_data_list if not pm_info.get('active', True)}
+    active_pms = set(pm_mapping_df[pm_mapping_df['active'] == True]['pm'].values)
+    inactive_pms = set(pm_mapping_df[pm_mapping_df['active'] == False]['pm'].values)
     all_expected_pms = active_pms | inactive_pms
     
     # Get PMs that actually have current data
@@ -117,9 +92,8 @@ def validate_and_enhance_balance_data(balance_df, curr_timestamp, pm_data_list):
     for missing_pm in missing_active_pms:
         print(f"Active PM missing data: {missing_pm}, attempting fallback...")
         
-        # new
-        fallback_data = get_fallback_balance_data(missing_pm, curr_timestamp, pm_data_list)
- 
+        fallback_data = get_fallback_balance_data(missing_pm, curr_timestamp)
+        
         if not fallback_data.empty:
             fallback_data['timestamp'] = pd.to_datetime(fallback_data['timestamp'])
             original_timestamp = fallback_data.iloc[0]['timestamp']
@@ -168,8 +142,10 @@ def main():
         latest_shares = shares.sort_values(by='timestamp', ascending=False).drop_duplicates(subset='pm')
         # print(latest_shares)
 
-        grouping_df = pd.DataFrame(credentials_dev.PM_DATA)
+        # grouping_df = pd.DataFrame(credentials.PM_DATA)
         # print(grouping_df)
+        pm_mapping_query = 'SELECT pm, pm_group, "group", fund, active, if_btc FROM pm_mapping;'
+        grouping_df = db_utils.get_db_table(pm_mapping_query)
 
         query = f'''SELECT 
             timestamp, 
@@ -189,16 +165,15 @@ def main():
         # print(balance)
 
         # # --- TESTING FALLBACK LOGIC ---
-        # Drop the latest row for pm 'cta_alphamike' to force fallback
+        # # Drop the latest row for pm 'cta_alphamike' to force fallback
         # if "cta_alphamike" in balance['pm'].values:
         #     latest_idx = balance.loc[balance['pm'] == 'cta_alphamike', 'timestamp'].idxmax()
         #     balance = balance.drop(latest_idx)
         #     print("\n[TEST] Dropped latest row for pm cta_alphamike to trigger fallback.\n")
 
-
         # ===== NEW VALIDATION AND FALLBACK LOGIC =====
         balance_enhanced, validation_log = validate_and_enhance_balance_data(
-            balance, curr, credentials_dev.PM_DATA
+            balance, curr
         )
         
         print("\nValidation Log:")
@@ -284,13 +259,15 @@ def main():
         print('Final pm_result_df with fallback and inactive indicators:')
         print(pm_result_df)
 
-        # URL = 'https://docs.google.com/spreadsheets/d/1RDA5hceXI4KOqAWJgdu8E_Rp0VueWfkCQEZemtcYUqY/edit?gid=0#gid=0'
-        # sheet_name = 'Sheet3'
-        # sheet_utils.set_dataframe(df=pm_result_df, sheet_name=sheet_name, url=URL)
+        
         # Save results
         df_db = pm_result_df.copy()
         df_db = df_db[['timestamp', 'pm', 'balance', 'shares', 'nav', 'is_fallback']]
-        db_utils.df_to_table(table_name='nav_table_testing', df=df_db)
+        db_utils.df_to_table(table_name='nav_table', df=df_db)
+
+        # URL = 'https://docs.google.com/spreadsheets/d/1RDA5hceXI4KOqAWJgdu8E_Rp0VueWfkCQEZemtcYUqY/edit?gid=0#gid=0'
+        # sheet_name = 'Sheet3'
+        # sheet_utils.set_dataframe(df=df_db, sheet_name=sheet_name, url=URL)
 
         # ===== ENHANCED REPORTING =====
         active_info = validation_log['active_pms']
@@ -317,7 +294,7 @@ def main():
             
             # Send telegram notification
             try:
-                telegram.send_notif(fallback_msg, chat_id='-4638542566')
+                telegram.send_notif(fallback_msg)
             except Exception as e:
                 print(f"Failed to send fallback telegram notification: {e}")
                 
@@ -334,7 +311,7 @@ def main():
             
             # Send telegram notification
             try:
-                telegram.send_notif(missing_msg, chat_id='-4638542566')
+                telegram.send_notif(missing_msg)
             except Exception as e:
                 print(f"Failed to send missing data telegram notification: {e}")
         

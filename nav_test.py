@@ -35,29 +35,31 @@ def get_fallback_balance_data(pm, curr_timestamp, max_lookback_hours=2):
     # return pd.DataFrame()
     return fallback_data
 
-def get_pm_status_from_config(pm, pm_data_list):
-    """
-    Check if a PM is active based on the PM_DATA configuration
-    Returns: 'active', 'inactive', or 'not_found'
-    """
-    for pm_info in pm_data_list:
-        if pm_info['pm'] == pm:
-            if pm_info.get('active', False):  # Default to True if 'active' key doesn't exist
-                return 'active'
-            else:
-                return 'inactive'
-    
-    return 'not_found'  # PM not in configuration
-
-def validate_and_enhance_balance_data(balance_df, curr_timestamp, pm_data_list):
+def validate_and_enhance_balance_data(balance_df, curr_timestamp):
     """
     Validate balance data and handle missing PMs based on their active status
     - Inactive PMs: Use current data if available, but NO fallback if missing
     - Active PMs: Use current data or fallback data if missing
+    
+    Args:
+        balance_df: DataFrame with current balance data
+        curr_timestamp: Current timestamp for validation
+    
+    Returns:
+        tuple: (enhanced_balance_df, validation_log)
     """
+    # Get PM mapping data from database
+    pm_mapping_query = 'SELECT pm, pm_group, "group", fund, active, if_btc FROM pm_mapping;'
+    pm_mapping_df = db_utils.get_db_table(pm_mapping_query)
+    print('pm_mapping_df')
+    print(pm_mapping_df)
+    
+    if pm_mapping_df.empty:
+        raise ValueError("Failed to load PM mapping data from database")
+    
     # Create sets of PMs based on their active status
-    active_pms = {pm_info['pm'] for pm_info in pm_data_list if pm_info.get('active', True)}
-    inactive_pms = {pm_info['pm'] for pm_info in pm_data_list if not pm_info.get('active', True)}
+    active_pms = set(pm_mapping_df[pm_mapping_df['active'] == True]['pm'].values)
+    inactive_pms = set(pm_mapping_df[pm_mapping_df['active'] == False]['pm'].values)
     all_expected_pms = active_pms | inactive_pms
     
     # Get PMs that actually have current data
@@ -140,8 +142,10 @@ def main():
         latest_shares = shares.sort_values(by='timestamp', ascending=False).drop_duplicates(subset='pm')
         # print(latest_shares)
 
-        grouping_df = pd.DataFrame(credentials.PM_DATA)
+        # grouping_df = pd.DataFrame(credentials.PM_DATA)
         # print(grouping_df)
+        pm_mapping_query = 'SELECT pm, pm_group, "group", fund, active, if_btc FROM pm_mapping;'
+        grouping_df = db_utils.get_db_table(pm_mapping_query)
 
         query = f'''SELECT 
             timestamp, 
@@ -169,7 +173,7 @@ def main():
 
         # ===== NEW VALIDATION AND FALLBACK LOGIC =====
         balance_enhanced, validation_log = validate_and_enhance_balance_data(
-            balance, curr, credentials.PM_DATA
+            balance, curr
         )
         
         print("\nValidation Log:")
@@ -255,13 +259,14 @@ def main():
         print('Final pm_result_df with fallback and inactive indicators:')
         print(pm_result_df)
 
-        # URL = 'https://docs.google.com/spreadsheets/d/1RDA5hceXI4KOqAWJgdu8E_Rp0VueWfkCQEZemtcYUqY/edit?gid=0#gid=0'
-        # sheet_name = 'Sheet3'
-        # sheet_utils.set_dataframe(df=pm_result_df, sheet_name=sheet_name, url=URL)
         # Save results
         df_db = pm_result_df.copy()
         df_db = df_db[['timestamp', 'pm', 'balance', 'shares', 'nav', 'is_fallback']]
         db_utils.df_to_table(table_name='nav_table', df=df_db)
+
+        # URL = 'https://docs.google.com/spreadsheets/d/1RDA5hceXI4KOqAWJgdu8E_Rp0VueWfkCQEZemtcYUqY/edit?gid=0#gid=0'
+        # sheet_name = 'Sheet3'
+        # sheet_utils.set_dataframe(df=df_db, sheet_name=sheet_name, url=URL)
 
         # ===== ENHANCED REPORTING =====
         active_info = validation_log['active_pms']
