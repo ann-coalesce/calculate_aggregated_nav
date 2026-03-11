@@ -8,6 +8,14 @@ import sheet_utils
 import telegram
 
 
+def is_valid_timestamp(row, curr, curr_hour):
+    if row['update_frequency'] == 'minute':
+        return row['timestamp'] == curr
+    elif row['update_frequency'] == 'hour':
+        return row['timestamp'] == curr_hour
+    return True  # 未知頻率保守處理
+
+
 def get_fallback_balance_data(pm, curr_timestamp, max_lookback_hours=2):
     """
     Get the most recent valid balance data for a PM within the lookback period
@@ -32,18 +40,19 @@ def get_fallback_balance_data(pm, curr_timestamp, max_lookback_hours=2):
     '''
     
     fallback_data = db_utils.get_db_table(query=query)
-    # return pd.DataFrame()
     return fallback_data
 
-def validate_and_enhance_balance_data(balance_df, curr_timestamp):
+
+def validate_and_enhance_balance_data(balance_df, curr_timestamp, curr_hour):
     """
     Validate balance data and handle missing PMs based on their active status
     - Inactive PMs: Use current data if available, but NO fallback if missing
     - Active PMs: Use current data or fallback data if missing
     
     Args:
-        balance_df: DataFrame with current balance data
+        balance_df: DataFrame with current balance data (already filtered by is_valid_timestamp)
         curr_timestamp: Current timestamp for validation
+        curr_hour: Current hour timestamp for validation
     
     Returns:
         tuple: (enhanced_balance_df, validation_log)
@@ -129,22 +138,20 @@ def validate_and_enhance_balance_data(balance_df, curr_timestamp):
     
     return enhanced_balance, validation_log
 
+
 def main():
     try:
         # ----- for per minute update last minute's aggregated NAV ----
         curr = datetime.now(timezone.utc).replace(second=0, microsecond=0) - timedelta(minutes=1)
-        curr_hour = curr.replace(minute=0,second=0, microsecond=0)
+        curr_hour = curr.replace(minute=0, second=0, microsecond=0)
         prev_hour = curr_hour - timedelta(hours=1)
 
         query = 'select * from shares_table;'
         shares = db_utils.get_db_table(query=query)
         shares['timestamp'] = pd.to_datetime(shares['timestamp'])
         latest_shares = shares.sort_values(by='timestamp', ascending=False).drop_duplicates(subset='pm')
-        # print(latest_shares)
 
-        # grouping_df = pd.DataFrame(credentials.PM_DATA)
-        # print(grouping_df)
-        pm_mapping_query = 'SELECT pm, pm_group, "group", fund, active, if_btc FROM pm_mapping;'
+        pm_mapping_query = 'SELECT pm, pm_group, "group", fund, active, if_btc, update_frequency FROM pm_mapping;'
         grouping_df = db_utils.get_db_table(pm_mapping_query)
 
         query = f'''SELECT 
@@ -161,26 +168,20 @@ def main():
         balance = db_utils.get_db_table(query=query)
         balance['timestamp'] = pd.to_datetime(balance['timestamp'])
         balance = balance.loc[balance.groupby('pm')['timestamp'].idxmax()]
-        # print("Original balance data:")
-        # print(balance)
 
-        # # --- TESTING FALLBACK LOGIC ---
-        # # Drop the latest row for pm 'cta_alphamike' to force fallback
-        # if "cta_alphamike" in balance['pm'].values:
-        #     latest_idx = balance.loc[balance['pm'] == 'cta_alphamike', 'timestamp'].idxmax()
-        #     balance = balance.drop(latest_idx)
-        #     print("\n[TEST] Dropped latest row for pm cta_alphamike to trigger fallback.\n")
+        # ===== Filter out stale data based on update_frequency =====
+        balance = pd.merge(balance, grouping_df[['pm', 'update_frequency']], on='pm', how='left')
+        valid_mask = balance.apply(lambda row: is_valid_timestamp(row, curr, curr_hour), axis=1)
+        balance = balance[valid_mask].drop(columns=['update_frequency'])
+        # ===== End filter =====
 
         # ===== NEW VALIDATION AND FALLBACK LOGIC =====
         balance_enhanced, validation_log = validate_and_enhance_balance_data(
-            balance, curr
+            balance, curr, curr_hour
         )
         
         print("\nValidation Log:")
         print(json.dumps(validation_log, indent=2, default=str))
-        
-        # print("\nEnhanced balance data (with fallbacks):")
-        # print(balance_enhanced)
         
         # Log validation results to database (optional)
         validation_df = pd.DataFrame([validation_log])
@@ -189,35 +190,29 @@ def main():
         # ===== END VALIDATION LOGIC =====
 
         balance_merged = pd.merge(balance_enhanced, grouping_df, on='pm', how='left')
-        # print('balance_merged')
-        # print(balance_merged)
 
         # Add fallback and inactive indicators to final results
-        pm_grouped = balance_merged.groupby(by=['timestamp','pm_group']).agg({
-            'balance': 'sum',
-            'is_fallback': 'any',  # True if any component used fallback data
-            'is_inactive': 'any'   # True if any component was inactive
-        }).reset_index()
-        # print('pm_grouped')
-        # print(pm_grouped)
-        pm_grouped.rename(columns={'pm_group':'pm'}, inplace=True)
-
-        group_grouped = balance_merged.groupby(by=['timestamp','group']).agg({
+        pm_grouped = balance_merged.groupby(by=['timestamp', 'pm_group']).agg({
             'balance': 'sum',
             'is_fallback': 'any',
             'is_inactive': 'any'
         }).reset_index()
-        # print('group_grouped')
-        # print(group_grouped)
-        group_grouped.rename(columns={'group':'pm'}, inplace=True)
+        pm_grouped.rename(columns={'pm_group': 'pm'}, inplace=True)
+
+        group_grouped = balance_merged.groupby(by=['timestamp', 'group']).agg({
+            'balance': 'sum',
+            'is_fallback': 'any',
+            'is_inactive': 'any'
+        }).reset_index()
+        group_grouped.rename(columns={'group': 'pm'}, inplace=True)
 
         fund_grouped = balance_merged.groupby(by=['fund']).agg({
-            'balance': 'sum', 
+            'balance': 'sum',
             'timestamp': 'max',
             'is_fallback': 'any',
             'is_inactive': 'any'
         }).reset_index()
-        fund_grouped.rename(columns={'fund':'pm'}, inplace=True)
+        fund_grouped.rename(columns={'fund': 'pm'}, inplace=True)
         
         # Handle duplicated rows for gross calculations
         duplicated_rows = fund_grouped[fund_grouped['pm'] == 'sp1'].copy()
@@ -236,12 +231,10 @@ def main():
         duplicated_rows_5['pm'] = 'sp2-classa-gross'
 
         fund_grouped = pd.concat([fund_grouped, duplicated_rows, duplicated_rows_2, duplicated_rows_3, duplicated_rows_4, duplicated_rows_5])
-        # print('fund_grouped')
-        # print(fund_grouped)
 
         bal_concat = pd.concat([pm_grouped, group_grouped, fund_grouped])
 
-        pm_result_df = pd.merge(bal_concat, latest_shares[['pm','shares']], on='pm', how='left')
+        pm_result_df = pd.merge(bal_concat, latest_shares[['pm', 'shares']], on='pm', how='left')
         pm_result_df['nav'] = pm_result_df.apply(
             lambda row: 0 if pd.isna(row['shares']) or row['shares'] == 0 else row['balance'] / row['shares'],
             axis=1
@@ -251,22 +244,21 @@ def main():
         
         if curr.minute != 0:
             print('not including herm, fof if not hour 00')
-            pm_result_df = pm_result_df[~pm_result_df['pm'].isin(['sp1-fof-tangoecho', 'sp1-fof-hermeneutic', 'sp1-fof', 'sp1-cash-cash', 'sp1-cash','sp1-fof-northrock', 'sp1-fof-defiance', 'sp2-cash-cash', 'sp2-cash', 'sp3-cash-cash', 'sp3-cash', 'sp2-classb-cash-cash','sp2-classb-cash'])]
+            pm_result_df = pm_result_df[~pm_result_df['pm'].isin(['sp1-fof-tangoecho', 'sp1-fof-hermeneutic', 'sp1-fof', 'sp1-cash-cash', 'sp1-cash', 'sp1-fof-northrock', 'sp1-fof-defiance', 'sp2-cash-cash', 'sp2-cash', 'sp3-cash-cash', 'sp3-cash', 'sp2-classb-cash-cash', 'sp2-classb-cash'])]
         
         pm_result_df = pm_result_df[pm_result_df['pm'] != 'sp1-sma-robinfunding']
-        pm_result_df = pm_result_df[~pm_result_df['pm'].isin(['sp2', 'sp2-gross', 'sp2-sma', 'sp2-sma-romeo'])] 
+        pm_result_df = pm_result_df[~pm_result_df['pm'].isin(['sp2', 'sp2-gross', 'sp2-sma', 'sp2-sma-romeo'])]
 
         print('Final pm_result_df with fallback and inactive indicators:')
         print(pm_result_df)
 
-        
         # Save results
         df_db = pm_result_df.copy()
         df_db = df_db[['timestamp', 'pm', 'balance', 'shares', 'nav', 'is_fallback']]
         db_utils.df_to_table(table_name='nav_table', df=df_db)
 
         # URL = 'https://docs.google.com/spreadsheets/d/1RDA5hceXI4KOqAWJgdu8E_Rp0VueWfkCQEZemtcYUqY/edit?gid=0#gid=0'
-        # sheet_name = 'Sheet3'
+        # sheet_name = 'fallback-test'
         # sheet_utils.set_dataframe(df=df_db, sheet_name=sheet_name, url=URL)
 
         # ===== ENHANCED REPORTING =====
@@ -275,7 +267,6 @@ def main():
         
         print("\n=== DATA VALIDATION REPORT ===")
         
-        # Active PMs status
         print(f"ACTIVE PMs ({active_info['expected_count']} expected):")
         print(f"  ✓ With current data: {len(active_info['with_current_data'])} PMs")
         if active_info['with_current_data']:
@@ -284,7 +275,6 @@ def main():
         if active_info['using_fallback_data']:
             print(f"  ⚠ Using fallback data: {len(active_info['using_fallback_data'])} PMs")
             
-            # Format telegram message for fallback data usage
             fallback_msg = f"⚠️ NAV AGGREGATION ALERT ⚠️\n\n"
             fallback_msg += f"{len(active_info['using_fallback_data'])} active PMs using fallback data:\n"
             for fallback_info in active_info['using_fallback_data']:
@@ -292,7 +282,6 @@ def main():
                 print(f"    - {fallback_info['pm']}: from {fallback_info['fallback_timestamp']}")
             fallback_msg += f"\n⚠️ Check data pipeline immediately!"
             
-            # Send telegram notification
             try:
                 telegram.send_notif(fallback_msg)
             except Exception as e:
@@ -302,39 +291,29 @@ def main():
             print(f"  ❌ Completely missing: {len(active_info['completely_missing'])} PMs")
             print(f"    {active_info['completely_missing']}")
             
-            # Format telegram message for completely missing data
             missing_msg = f"🚨 CRITICAL NAV AGGREGATION ALERT 🚨\n\n"
             missing_msg += f"{len(active_info['completely_missing'])} active PMs have NO DATA:\n"
             for pm in active_info['completely_missing']:
                 missing_msg += f"• {pm}\n"
             missing_msg += f"\n🚨 URGENT: These PMs have no current or fallback data!"
             
-            # Send telegram notification
             try:
                 telegram.send_notif(missing_msg)
             except Exception as e:
                 print(f"Failed to send missing data telegram notification: {e}")
         
-        
-        # Inactive PMs status
-        # print(f"\nINACTIVE PMs ({inactive_info['expected_count']} expected):")
         if inactive_info['with_current_data']:
             print(f"  ✓ With current data: {len(inactive_info['with_current_data'])} PMs")
             print(f"    {inactive_info['with_current_data']}")
-        # if inactive_info['missing_data']:
-        #     print(f"  - Missing data (expected): {len(inactive_info['missing_data'])} PMs")
-        #     print(f"    {inactive_info['missing_data']}")
         
-        # Overall summary
         total_processed = (len(active_info['with_current_data']) + 
-                         len(active_info['using_fallback_data']) + 
-                         len(inactive_info['with_current_data']))
+                           len(active_info['using_fallback_data']) + 
+                           len(inactive_info['with_current_data']))
         
         print(f"\nSUMMARY:")
         print(f"  Total PMs processed: {total_processed}/{validation_log['summary']['total_expected_pms']}")
         print(f"  Data quality: {'✓ GOOD' if not active_info['completely_missing'] else '⚠ NEEDS ATTENTION'}")
         
-        # Issue-based alerts
         if active_info['using_fallback_data']:
             print(f"\n🔔 ALERT: {len(active_info['using_fallback_data'])} active PMs using fallback data - check data pipeline")
         
