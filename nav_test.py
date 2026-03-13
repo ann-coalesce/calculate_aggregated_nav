@@ -60,8 +60,8 @@ def validate_and_enhance_balance_data(balance_df, curr_timestamp, curr_hour):
     # Get PM mapping data from database
     pm_mapping_query = 'SELECT pm, pm_group, "group", fund, active, if_btc FROM pm_mapping;'
     pm_mapping_df = db_utils.get_db_table(pm_mapping_query)
-    print('pm_mapping_df')
-    print(pm_mapping_df)
+    # print('pm_mapping_df')
+    # print(pm_mapping_df)
     
     if pm_mapping_df.empty:
         raise ValueError("Failed to load PM mapping data from database")
@@ -123,8 +123,8 @@ def validate_and_enhance_balance_data(balance_df, curr_timestamp, curr_hour):
             print(f"No fallback data found for active PM {missing_pm}")
     
     # Handle missing inactive PMs - just log them
-    for inactive_pm in validation_log['inactive_pms']['missing_data']:
-        print(f"PM {inactive_pm} is inactive and missing data - skipping (no fallback)")
+    # for inactive_pm in validation_log['inactive_pms']['missing_data']:
+        # print(f"PM {inactive_pm} is inactive and missing data - skipping (no fallback)")
     
     # Mark existing data as fallback or not, and active/inactive
     enhanced_balance = balance_df.copy()
@@ -180,8 +180,8 @@ def main():
             balance, curr, curr_hour
         )
         
-        print("\nValidation Log:")
-        print(json.dumps(validation_log, indent=2, default=str))
+        # print("\nValidation Log:")
+        # print(json.dumps(validation_log, indent=2, default=str))
         
         # Log validation results to database (optional)
         validation_df = pd.DataFrame([validation_log])
@@ -250,7 +250,9 @@ def main():
         pm_result_df = pm_result_df[~pm_result_df['pm'].isin(['sp2', 'sp2-gross', 'sp2-sma', 'sp2-sma-romeo'])]
 
         print('Final pm_result_df with fallback and inactive indicators:')
-        print(pm_result_df)
+        with pd.option_context('display.max_rows', None, 'display.max_columns', None, 'display.width', None):
+            print(pm_result_df.to_string())
+        # print(pm_result_df)
 
         # Save results
         df_db = pm_result_df.copy()

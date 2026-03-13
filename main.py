@@ -11,5 +11,6 @@ nav_test.main()
 end = time.time()
 
 print('time taken: ', end-start)
+print()
 # print('new nav calc logic')
 # print("completed")
